@@ -15,8 +15,14 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ci_publisher import store
-from ci_publisher.auth import _abbreviate, _extract_code, complete_manual_auth
+from ci_publisher.auth import (
+    _abbreviate,
+    _extract_code,
+    begin_manual_auth,
+    complete_manual_auth,
+)
 from ci_publisher.config import load_client_config
+from ci_publisher.auth import DEFAULT_SCOPES
 from ci_publisher.errors import AuthError, ConfigError, QuotaExceeded, ScheduleError
 from ci_publisher.quota import COSTS, QuotaLedger, quota_day
 from ci_publisher.youtube import parse_publish_at
@@ -315,6 +321,74 @@ class AbbreviateTest(unittest.TestCase):
         a = _abbreviate("111-aaa.apps.googleusercontent.com")
         b = _abbreviate("222-bbb.apps.googleusercontent.com")
         self.assertNotEqual(a, b)
+
+
+class PkceTest(TempHomeTest):
+    """PKCE must actually be switched on.
+
+    google-auth-oauthlib's from_client_config pops autogenerate_code_verifier
+    with a default of None, which is falsy, so a flow built without passing it
+    explicitly sends no code_challenge at all and parks an empty verifier.
+    """
+
+    def setUp(self):
+        super().setUp()
+        secrets = self.home / "client_secret.json"
+        secrets.write_text(json.dumps(INSTALLED_CLIENT))
+        self._prev_secrets = os.environ.get("CI_PUBLISHER_CLIENT_SECRETS")
+        os.environ["CI_PUBLISHER_CLIENT_SECRETS"] = str(secrets)
+
+    def tearDown(self):
+        if self._prev_secrets is None:
+            os.environ.pop("CI_PUBLISHER_CLIENT_SECRETS", None)
+        else:
+            os.environ["CI_PUBLISHER_CLIENT_SECRETS"] = self._prev_secrets
+        super().tearDown()
+
+    def test_consent_url_carries_a_code_challenge(self):
+        url, _ = begin_manual_auth("youtube", port=8765)
+        self.assertIn("code_challenge=", url)
+        self.assertIn("code_challenge_method=S256", url)
+
+    def test_a_real_verifier_is_parked(self):
+        begin_manual_auth("youtube", port=8765)
+        verifier = store.load_pending().get("code_verifier")
+        self.assertTrue(verifier, "no PKCE verifier was parked")
+        self.assertGreaterEqual(len(verifier), 43)  # RFC 7636 minimum
+
+    def test_parked_verifier_matches_the_challenge_in_the_url(self):
+        import base64
+        import hashlib
+        import urllib.parse
+
+        url, _ = begin_manual_auth("youtube", port=8765)
+        sent = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["code_challenge"][0]
+        verifier = store.load_pending()["code_verifier"]
+        expected = (
+            base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest())
+            .decode()
+            .rstrip("=")
+        )
+        self.assertEqual(sent, expected)
+
+    def test_consent_url_requests_offline_access(self):
+        url, _ = begin_manual_auth("youtube", port=8765)
+        self.assertIn("access_type=offline", url)
+
+    def test_completing_a_verifierless_flow_is_refused(self):
+        store.save_pending(
+            {
+                "platform": "youtube",
+                "client_id": INSTALLED_CLIENT["installed"]["client_id"],
+                "scopes": list(DEFAULT_SCOPES),
+                "redirect_uri": "http://localhost:8765/",
+                "state": "s",
+                "code_verifier": "",
+            }
+        )
+        with self.assertRaises(AuthError) as caught:
+            complete_manual_auth("youtube", "http://localhost:8765/?code=x")
+        self.assertIn("PKCE", str(caught.exception))
 
 
 if __name__ == "__main__":

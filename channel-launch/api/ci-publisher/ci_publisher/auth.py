@@ -62,7 +62,9 @@ def authorize(
         # The manual path persists the token itself, inside complete_manual_auth.
         return _interactive_manual(platform, scopes, port or 8765), client_id
 
-    flow = InstalledAppFlow.from_client_config(client_config, scopes=scopes)
+    flow = InstalledAppFlow.from_client_config(
+        client_config, scopes=scopes, autogenerate_code_verifier=True
+    )
     creds = flow.run_local_server(
         port=port,
         open_browser=True,
@@ -98,12 +100,24 @@ def begin_manual_auth(
     client_config, client_id, path = load_client_config()
     redirect_uri = f"http://localhost:{port}/"
 
+    # autogenerate_code_verifier must be passed explicitly: from_client_config
+    # pops it with a default of None, which is falsy, so the library quietly
+    # skips PKCE and sends no code_challenge at all.
     flow = InstalledAppFlow.from_client_config(
-        client_config, scopes=scopes, redirect_uri=redirect_uri
+        client_config,
+        scopes=scopes,
+        redirect_uri=redirect_uri,
+        autogenerate_code_verifier=True,
     )
     auth_url, state = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true"
     )
+    if not flow.code_verifier:
+        raise AuthError(
+            "The OAuth library produced no PKCE code verifier, so the consent "
+            "URL would carry no code_challenge. Refusing to continue rather "
+            "than silently dropping PKCE."
+        )
 
     store.save_pending(
         {
@@ -146,12 +160,21 @@ def complete_manual_auth(platform: str = "youtube", pasted: str = "") -> Credent
 
     code = _extract_code(pasted)
 
+    code_verifier = pending.get("code_verifier")
+    if not code_verifier:
+        raise AuthError(
+            "The parked flow recorded no PKCE code verifier, so it was "
+            "started by a version that skipped PKCE. Run "
+            f"'auth {platform} --print-url' for a fresh URL and approve "
+            "that one instead."
+        )
+
     flow = InstalledAppFlow.from_client_config(
         client_config,
         scopes=pending.get("scopes") or DEFAULT_SCOPES,
         redirect_uri=pending.get("redirect_uri"),
         state=pending.get("state"),
-        code_verifier=pending.get("code_verifier"),
+        code_verifier=code_verifier,
     )
     try:
         flow.fetch_token(code=code)
