@@ -26,6 +26,7 @@ DAILY_BUDGET = 10_000
 COSTS = {
     "videos.insert": 1600,
     "videos.update": 50,
+    "channels.update": 50,
     "thumbnails.set": 50,
     "playlistItems.insert": 50,
     "search.list": 100,

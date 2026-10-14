@@ -54,6 +54,19 @@ On a headless or remote machine, use `--no-browser`. It prints the consent
 URL, you approve in any browser, the browser fails to load a localhost page,
 and you paste that page's full URL back. Nothing needs to be listening there.
 
+When the approval happens somewhere other than the shell running the command,
+split it in two:
+
+```bash
+python3 -m ci_publisher auth youtube --print-url        # prints the URL, exits
+python3 -m ci_publisher auth youtube --code '<the URL the browser landed on>'
+```
+
+`--print-url` parks the PKCE `code_verifier` in
+`~/.ci-publisher/pending_auth.json`, because that value otherwise lives only
+in memory and the exchange would fail with "code verifier is invalid". The
+authorisation code itself expires within minutes, so run `--code` promptly.
+
 ## Commands
 
 ```bash

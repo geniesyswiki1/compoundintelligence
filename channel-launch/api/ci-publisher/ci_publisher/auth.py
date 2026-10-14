@@ -11,6 +11,7 @@ redirect_uri of http://localhost needs no port and no real handler.
 
 import json
 import urllib.parse
+from pathlib import Path
 
 from google.auth.transport.requests import Request
 from google.auth.exceptions import RefreshError
@@ -57,24 +58,26 @@ def authorize(
     client_config, client_id, path = load_client_config()
     print(f"Using OAuth client from {path}")
 
-    flow = InstalledAppFlow.from_client_config(client_config, scopes=scopes)
+    if not open_browser:
+        # The manual path persists the token itself, inside complete_manual_auth.
+        return _interactive_manual(platform, scopes, port or 8765), client_id
 
-    if open_browser:
-        creds = flow.run_local_server(
-            port=port,
-            open_browser=True,
-            prompt="consent",
-            access_type="offline",
-            authorization_prompt_message=(
-                "Opening your browser for Google consent. If it does not open, "
-                "visit:\n\n  {url}\n"
-            ),
-            success_message=(
-                "Authorised. You can close this tab and return to the terminal."
-            ),
-        )
-    else:
-        creds = _manual_loopback(flow, port or 8765)
+    flow = InstalledAppFlow.from_client_config(
+        client_config, scopes=scopes, autogenerate_code_verifier=True
+    )
+    creds = flow.run_local_server(
+        port=port,
+        open_browser=True,
+        prompt="consent",
+        access_type="offline",
+        authorization_prompt_message=(
+            "Opening your browser for Google consent. If it does not open, "
+            "visit:\n\n  {url}\n"
+        ),
+        success_message=(
+            "Authorised. You can close this tab and return to the terminal."
+        ),
+    )
 
     info = json.loads(creds.to_json())
     saved = store.save_token(platform, info, client_id, list(creds.scopes or scopes))
@@ -82,16 +85,120 @@ def authorize(
     return creds, client_id
 
 
-def _manual_loopback(flow: InstalledAppFlow, port: int) -> Credentials:
-    """Consent without a local listener: the user pastes the redirect URL back.
+def begin_manual_auth(
+    platform: str = "youtube",
+    scopes: list[str] | None = None,
+    port: int = 8765,
+) -> tuple[str, Path]:
+    """Start a consent flow without a local listener.
 
-    The browser lands on a dead page at http://localhost:PORT/ carrying the
-    code in its query string. Nothing needs to be listening there.
+    Returns (consent_url, client_secrets_path) and parks the PKCE verifier so
+    complete_manual_auth can finish the exchange from a separate process.
     """
-    flow.redirect_uri = f"http://localhost:{port}/"
-    auth_url, _ = flow.authorization_url(
+    _check_platform(platform)
+    scopes = scopes or DEFAULT_SCOPES
+    client_config, client_id, path = load_client_config()
+    redirect_uri = f"http://localhost:{port}/"
+
+    # autogenerate_code_verifier must be passed explicitly: from_client_config
+    # pops it with a default of None, which is falsy, so the library quietly
+    # skips PKCE and sends no code_challenge at all.
+    flow = InstalledAppFlow.from_client_config(
+        client_config,
+        scopes=scopes,
+        redirect_uri=redirect_uri,
+        autogenerate_code_verifier=True,
+    )
+    auth_url, state = flow.authorization_url(
         access_type="offline", prompt="consent", include_granted_scopes="true"
     )
+    if not flow.code_verifier:
+        raise AuthError(
+            "The OAuth library produced no PKCE code verifier, so the consent "
+            "URL would carry no code_challenge. Refusing to continue rather "
+            "than silently dropping PKCE."
+        )
+
+    store.save_pending(
+        {
+            "platform": platform,
+            "client_id": client_id,
+            "scopes": list(scopes),
+            "redirect_uri": redirect_uri,
+            "state": state,
+            "code_verifier": flow.code_verifier,
+        }
+    )
+    return auth_url, path
+
+
+def complete_manual_auth(platform: str = "youtube", pasted: str = "") -> Credentials:
+    """Finish a flow begun by begin_manual_auth, from the pasted redirect URL."""
+    _check_platform(platform)
+    pending = store.load_pending()
+    if not pending:
+        raise AuthError(
+            "No consent flow is waiting to be completed. Start one with:\n\n"
+            f"  python3 -m ci_publisher auth {platform} --print-url\n"
+        )
+    if pending.get("platform") != platform:
+        raise AuthError(
+            f"The waiting consent flow is for {pending.get('platform')!r}, "
+            f"not {platform!r}."
+        )
+
+    client_config, client_id, secrets_path = load_client_config()
+    if pending.get("client_id") != client_id:
+        raise AuthError(
+            "The client secrets file changed after the consent URL was "
+            "generated, so the parked verifier no longer matches.\n\n"
+            f"  URL was generated for: {_abbreviate(pending.get('client_id') or '')}\n"
+            f"  client secrets now:    {_abbreviate(client_id)}\n"
+            f"                         ({secrets_path})\n\n"
+            f"Re-run 'auth {platform} --print-url' for a fresh URL."
+        )
+
+    code = _extract_code(pasted)
+
+    code_verifier = pending.get("code_verifier")
+    if not code_verifier:
+        raise AuthError(
+            "The parked flow recorded no PKCE code verifier, so it was "
+            "started by a version that skipped PKCE. Run "
+            f"'auth {platform} --print-url' for a fresh URL and approve "
+            "that one instead."
+        )
+
+    flow = InstalledAppFlow.from_client_config(
+        client_config,
+        scopes=pending.get("scopes") or DEFAULT_SCOPES,
+        redirect_uri=pending.get("redirect_uri"),
+        state=pending.get("state"),
+        code_verifier=code_verifier,
+    )
+    try:
+        flow.fetch_token(code=code)
+    except Exception as exc:  # oauthlib raises a family of these
+        raise AuthError(
+            f"Token exchange failed: {exc}\n\n"
+            "An authorisation code is single use and expires within minutes. "
+            f"Run 'auth {platform} --print-url' for a fresh URL and approve "
+            "again. If this reads invalid_grant, the code was most likely "
+            "already used or has expired."
+        ) from exc
+
+    creds = flow.credentials
+    info = json.loads(creds.to_json())
+    scopes = list(creds.scopes or pending.get("scopes") or DEFAULT_SCOPES)
+    saved = store.save_token(platform, info, client_id, scopes)
+    store.clear_pending()
+    print(f"Token saved to {saved}")
+    return creds
+
+
+def _interactive_manual(platform: str, scopes: list[str], port: int) -> Credentials:
+    """Interactive paste flow, for a human at a terminal on a headless box."""
+    auth_url, _ = begin_manual_auth(platform, scopes=scopes, port=port)
     print(
         "Open this URL in any browser signed in to the channel's Google "
         "account:\n\n"
@@ -101,16 +208,7 @@ def _manual_loopback(flow: InstalledAppFlow, port: int) -> Credentials:
         "paste it below.\n"
     )
     pasted = input("Redirect URL (or bare code): ").strip()
-    code = _extract_code(pasted)
-    try:
-        flow.fetch_token(code=code)
-    except Exception as exc:  # oauthlib raises a family of these
-        raise AuthError(
-            f"Token exchange failed: {exc}\n\n"
-            "An authorisation code is single use and expires in minutes. "
-            "Re-run the command for a fresh one."
-        ) from exc
-    return flow.credentials
+    return complete_manual_auth(platform, pasted)
 
 
 def _extract_code(pasted: str) -> str:
