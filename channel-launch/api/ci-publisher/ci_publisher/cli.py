@@ -5,7 +5,14 @@ import json
 import sys
 
 from ci_publisher import __version__, store, youtube
-from ci_publisher.auth import DEFAULT_SCOPES, SCOPES, authorize, load_credentials
+from ci_publisher.auth import (
+    DEFAULT_SCOPES,
+    SCOPES,
+    authorize,
+    begin_manual_auth,
+    complete_manual_auth,
+    load_credentials,
+)
 from ci_publisher.config import load_client_config
 from ci_publisher.errors import CiPublisherError
 from ci_publisher.quota import QuotaLedger
@@ -27,11 +34,23 @@ def build_parser() -> argparse.ArgumentParser:
         default=0,
         help="loopback port (default: an ephemeral one chosen by the OS)",
     )
-    p_auth.add_argument(
+    auth_mode = p_auth.add_mutually_exclusive_group()
+    auth_mode.add_argument(
         "--no-browser",
         action="store_true",
-        help="print the consent URL and accept a pasted redirect URL instead "
-        "of opening a browser (for a headless or remote machine)",
+        help="print the consent URL and wait for a pasted redirect URL "
+        "instead of opening a browser (for a headless or remote machine)",
+    )
+    auth_mode.add_argument(
+        "--print-url",
+        action="store_true",
+        help="print the consent URL and exit without waiting, parking the "
+        "flow so --code can finish it later or elsewhere",
+    )
+    auth_mode.add_argument(
+        "--code",
+        help="finish a flow started by --print-url: pass the redirect URL "
+        "the browser landed on, or the bare code",
     )
     p_auth.add_argument(
         "--scope",
@@ -91,12 +110,36 @@ def build_parser() -> argparse.ArgumentParser:
 
 def cmd_auth(args) -> int:
     scopes = [SCOPES[name] for name in args.scope] if args.scope else DEFAULT_SCOPES
-    authorize(
-        args.platform,
-        scopes=scopes,
-        port=args.port,
-        open_browser=not args.no_browser,
-    )
+
+    if args.print_url:
+        auth_url, secrets_path = begin_manual_auth(
+            args.platform, scopes=scopes, port=args.port or 8765
+        )
+        print(f"Using OAuth client from {secrets_path}")
+        print()
+        print("Open this URL in a browser signed in to the channel's Google account:")
+        print()
+        print(f"  {auth_url}")
+        print()
+        print(
+            "Approve the request. The browser will then fail to load a\n"
+            "localhost page, which is expected and means it worked. Copy that\n"
+            "page's full URL from the address bar and finish with:\n\n"
+            f"  python3 -m ci_publisher auth {args.platform} --code '<paste the URL>'\n\n"
+            "The code expires within minutes, so do it promptly."
+        )
+        return 0
+
+    if args.code:
+        complete_manual_auth(args.platform, args.code)
+    else:
+        authorize(
+            args.platform,
+            scopes=scopes,
+            port=args.port,
+            open_browser=not args.no_browser,
+        )
+
     identity = youtube.whoami()
     print()
     print(f"Authorised channel: {identity['title']}  ({identity['channel_id']})")
