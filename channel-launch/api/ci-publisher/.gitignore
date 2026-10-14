@@ -1,0 +1,21 @@
+# Secrets - never commit these
+client_secret*.json
+*client_secret*.apps.googleusercontent.com.json
+.env
+.env.*
+!.env.example
+token*.json
+tokens/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+build/
+dist/
+
+# Local state
+*.log
+.DS_Store
